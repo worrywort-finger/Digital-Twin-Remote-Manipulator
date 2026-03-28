@@ -1,0 +1,47 @@
+import bpy
+import socket
+import math
+
+bpy.data.objects['part_2'].rotation_mode = 'XYZ'
+bpy.data.objects['part_1'].rotation_mode = 'XYZ'
+
+UDP_IP = "0.0.0.0"
+UDP_PORT = 9000
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind((UDP_IP, UDP_PORT))
+sock.setblocking(False)
+
+def listen_to_hand_tracking():
+    try:
+        data, addr = sock.recvfrom(1024) 
+        
+        # .strip() removes any invisible spaces or newlines that cause crashes
+        message = data.decode('utf-8').strip() 
+        
+        # Print the data so we can physically see it arriving
+        print(f"RECEIVED DATA: {message}")
+        
+        pan_str, tilt_str = message.split(',')
+        
+        pan_rad = math.radians(float(pan_str))
+        tilt_rad = math.radians(float(tilt_str))
+        
+        bpy.data.objects['part_2'].rotation_euler[2] = pan_rad
+        bpy.data.objects['part_1'].rotation_euler[1] = tilt_rad
+        
+    except BlockingIOError:
+        pass # Normal, no data right now
+    except Exception as e:
+        # If anything goes wrong, print the exact error but KEEP RUNNING!
+        print(f"IGNORING CORRUPT DATA: {e}") 
+        
+    return 0.016 
+
+# Safe restart
+if bpy.app.timers.is_registered(listen_to_hand_tracking):
+    bpy.app.timers.unregister(listen_to_hand_tracking)
+
+bpy.app.timers.register(listen_to_hand_tracking)
+print("Blender is now listening for Hand Tracking data on port 9000...")
