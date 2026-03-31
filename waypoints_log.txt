@@ -18,3 +18,12 @@ Waypoint Logged -> Pan: 105, Tilt: 94
 Waypoint Logged -> Pan: 74, Tilt: 73
 Waypoint Logged -> Pan: 117, Tilt: 78
 Waypoint Logged -> Pan: 112, Tilt: 96
+Waypoint Logged -> Pan: 113, Tilt: 72
+Waypoint Logged -> Pan: 115, Tilt: 94
+Waypoint Logged -> Pan: 116, Tilt: 94
+Waypoint Logged -> Pan: 116, Tilt: 95
+Waypoint Logged -> Pan: 104, Tilt: 81
+Waypoint Logged -> Pan: 92, Tilt: 83
+Waypoint Logged -> Pan: 117, Tilt: 90
+Waypoint Logged -> Pan: 101, Tilt: 105
+Waypoint Logged -> Pan: 112, Tilt: 80

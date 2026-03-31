@@ -20,6 +20,10 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
 mp_draw = mp.solutions.drawing_utils
+
+mp_face_detection = mp.solutions.face_detection
+face_detection = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.7)
+
 cap = cv2.VideoCapture(1)
 
 # ==========================================
@@ -35,7 +39,13 @@ playback_index = 0
 SMOOTHING_ALPHA = 0.1  
 prev_pan_angle = 0.0
 prev_tilt_angle = 0.0
-prev_sensitivity = 1.0 # --- NEW: Smooths the Z-axis depth changes ---
+prev_sensitivity = 1.0 
+
+# --- NEW: Predictive Kinematics Variables ---
+is_predicting = False      # Toggle for presentation demonstration
+PREDICTION_FACTOR = 1.5    # How many frames into the future to predict (Tune between 1.0 and 3.0)
+prev_tracker_x = 0.5
+prev_tracker_y = 0.5
 
 # Expanded State Machine Variables
 was_pinched = False
@@ -53,6 +63,8 @@ print(" [Peace Sign] : Snap to Center (Homing)")
 print(" [OK Sign]    : Log Waypoint to File")
 print(" [ r ] Key    : Toggle Recording")
 print(" [ p ] Key    : Trigger Playback")
+print(" [ a ] Key    : Toggle Autonomous Sentry Mode") 
+print(" [ k ] Key    : Toggle Predictive Kinematics") # --- NEW ---
 print(" [ l ] Key    : Manual Hardware Log")
 print(" [ q ] Key    : Quit")
 
@@ -65,27 +77,28 @@ while True:
         
     img = cv2.flip(img, 1)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    results = hands.process(img_rgb)
     display_text_override = "" 
 
+    # ---------------------------------------------------------
+    # BRANCH A: HUMAN TELEOPERATION
+    # ---------------------------------------------------------
     if system_mode in ["NORMAL", "RECORDING"]:
+        results = hands.process(img_rgb)
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
                 
                 lm = hand_landmarks.landmark
                 
-                # --- GESTURE 1: The Safety Clutch (Open/Fist) ---
+                # Gestures
                 fingers_curled = (lm[8].y > lm[6].y and lm[12].y > lm[10].y and lm[16].y > lm[14].y and lm[20].y > lm[18].y)
                 fingers_extended = (lm[8].y < lm[6].y and lm[12].y < lm[10].y and lm[16].y < lm[14].y and lm[20].y < lm[18].y)
 
-                # --- GESTURE 2: Homing (Peace Sign) ---
                 index_up = lm[8].y < lm[6].y
                 middle_up = lm[12].y < lm[10].y
                 ring_down = lm[16].y > lm[14].y
                 pinky_down = lm[20].y > lm[18].y
                 peace_sign = index_up and middle_up and ring_down and pinky_down
 
-                # --- GESTURE 3: Waypoint Logging ("OK" Sign) ---
                 pinch_dist = math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y)
                 ring_up = lm[16].y < lm[14].y
                 pinky_up = lm[20].y < lm[18].y
@@ -107,39 +120,55 @@ while True:
                     is_tracking = True
                 
                 # ==========================================
-                # THE KINEMATIC ENGINE (Tracking & Z-Axis)
+                # THE KINEMATIC ENGINE (Tracking & Z-Axis & Prediction)
                 # ==========================================
                 if is_tracking and not peace_sign:
                     tracker_node = lm[9]
                     
-                    # --- NEW: Z-Axis Depth Calculation ---
-                    # Measure distance from Wrist (Node 0) to Middle Knuckle (Node 9)
+                    curr_x = tracker_node.x
+                    curr_y = tracker_node.y
+                    
+                    # --- NEW: Predictive Math ---
+                    if is_predicting:
+                        # Calculate velocity (Change in position since last frame)
+                        vel_x = curr_x - prev_tracker_x
+                        vel_y = curr_y - prev_tracker_y
+                        
+                        # Project position into the future
+                        target_x = curr_x + (vel_x * PREDICTION_FACTOR)
+                        target_y = curr_y + (vel_y * PREDICTION_FACTOR)
+                        
+                        # Clamp values between 0.0 and 1.0 to prevent servos from crashing
+                        target_x = max(0.0, min(target_x, 1.0))
+                        target_y = max(0.0, min(target_y, 1.0))
+                        
+                        # Draw a green dot showing WHERE the robot thinks you are going
+                        cv2.circle(img, (int(target_x * img.shape[1]), int(target_y * img.shape[0])), 8, (0, 255, 0), cv2.FILLED)
+                    else:
+                        target_x = curr_x
+                        target_y = curr_y
+                    
+                    # Update history for the NEXT frame's velocity calculation
+                    prev_tracker_x = curr_x
+                    prev_tracker_y = curr_y
+
+                    # Calculate Z-Axis Depth (Same as before)
                     hand_size = math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y)
-                    
-                    # Clamp the size to prevent extreme glitching (usually between 0.15 and 0.45)
                     hand_size = max(0.15, min(hand_size, 0.45))
-                    
-                    # Map physical size to a Sensitivity Multiplier (0.3x to 1.8x speed)
                     target_sensitivity = map_range(hand_size, 0.15, 0.45, 0.3, 1.8)
-                    
-                    # Apply EMA Smoothing to the Z-axis so the gears don't shift too violently
                     current_sensitivity = (0.1 * target_sensitivity) + (0.9 * prev_sensitivity)
                     prev_sensitivity = current_sensitivity
                     
-                    # --- NEW: Center-Relative Scaling ---
-                    # Calculate how far the hand is from the absolute center of the screen (0.5, 0.5)
-                    dx = tracker_node.x - 0.5
-                    dy = tracker_node.y - 0.5
+                    # Apply Target X/Y (Predicted or Normal) to the Center-Relative Scaling
+                    dx = target_x - 0.5
+                    dy = target_y - 0.5
                     
-                    # Multiply that distance by our depth gear, then add it back to the center
                     scaled_x = 0.5 + (dx * current_sensitivity)
                     scaled_y = 0.5 + (dy * current_sensitivity)
 
-                    # Map the scaled coordinates to the servo angles
                     raw_pan = map_range(scaled_x, 0.0, 1.0, -60.0, 60.0)
                     raw_tilt = map_range(scaled_y, 0.0, 1.0, 60.0, -60.0)
                     
-                    # Apply standard X/Y EMA smoothing
                     smoothed_pan = (SMOOTHING_ALPHA * raw_pan) + ((1.0 - SMOOTHING_ALPHA) * prev_pan_angle)
                     smoothed_tilt = (SMOOTHING_ALPHA * raw_tilt) + ((1.0 - SMOOTHING_ALPHA) * prev_tilt_angle)
                     
@@ -155,7 +184,7 @@ while True:
                     if system_mode == "RECORDING":
                         memory_buffer.append((smoothed_pan, smoothed_tilt, servo_pan, servo_tilt))
 
-                # Pinch Logging Routine (OK Sign)
+                # Waypoint Logging
                 if is_pinching and not was_pinched and is_tracking:
                     with open("waypoints_log.txt", "a") as file:
                         file.write(f"Waypoint Logged -> Pan: {servo_pan}, Tilt: {servo_tilt}\n")
@@ -171,6 +200,9 @@ while True:
 
                 mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
+    # ---------------------------------------------------------
+    # BRANCH B & C remain identical...
+    # ---------------------------------------------------------
     elif system_mode == "PLAYBACK":
         if playback_index < len(memory_buffer):
             saved_pan, saved_tilt, saved_span, saved_stilt = memory_buffer[playback_index]
@@ -180,10 +212,39 @@ while True:
         else:
             system_mode = "NORMAL"
 
+    elif system_mode == "AUTONOMOUS":
+        results_face = face_detection.process(img_rgb)
+        if results_face.detections:
+            detection = results_face.detections[0]
+            bboxC = detection.location_data.relative_bounding_box
+            face_x = bboxC.xmin + (bboxC.width / 2)
+            face_y = bboxC.ymin + (bboxC.height / 2)
+            
+            raw_pan = map_range(face_x, 0.0, 1.0, -60.0, 60.0)
+            raw_tilt = map_range(face_y, 0.0, 1.0, 60.0, -60.0)
+            
+            smoothed_pan = (SMOOTHING_ALPHA * raw_pan) + ((1.0 - SMOOTHING_ALPHA) * prev_pan_angle)
+            smoothed_tilt = (SMOOTHING_ALPHA * raw_tilt) + ((1.0 - SMOOTHING_ALPHA) * prev_tilt_angle)
+            
+            prev_pan_angle = smoothed_pan
+            prev_tilt_angle = smoothed_tilt
+            
+            servo_pan = int(smoothed_pan + 90)
+            servo_tilt = int(smoothed_tilt + 90)
+            
+            sock.sendto(f"{smoothed_pan},{smoothed_tilt}".encode(), (BLENDER_IP, BLENDER_PORT))
+            sock.sendto(f"P:{servo_pan},T:{servo_tilt}".encode(), (ESP32_IP, ESP32_PORT))
+            
+            ih, iw, _ = img.shape
+            x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * ih)
+            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2) 
+            cv2.line(img, (x + int(w/2), y), (x + int(w/2), y + h), (0, 0, 255), 1) 
+            cv2.line(img, (x, y + int(h/2)), (x + w, y + int(h/2)), (0, 0, 255), 1)
+
     # ==========================================
     # 5. VISUAL HUD & KEYBOARD HOOKS
     # ==========================================
-    cv2.rectangle(img, (0, 0), (640, 80), (0, 0, 0), cv2.FILLED) # Made the black box slightly taller
+    cv2.rectangle(img, (0, 0), (640, 100), (0, 0, 0), cv2.FILLED) # Taller HUD for new text
 
     if display_text_override != "":
         cv2.putText(img, f"STATE: {display_text_override}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
@@ -196,34 +257,30 @@ while True:
         cv2.circle(img, (600, 20), 10, (0, 0, 255), cv2.FILLED) 
     elif system_mode == "PLAYBACK":
         cv2.putText(img, f"PLAYBACK [{playback_index}/{len(memory_buffer)}]", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    elif system_mode == "AUTONOMOUS":
+        cv2.putText(img, "STATE: AUTONOMOUS TARGET LOCK", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-    # --- NEW: Draw the Z-Axis Gear Ratio on the HUD ---
-    gear_text = f"SENSITIVITY GEAR: {prev_sensitivity:.2f}x"
-    if prev_sensitivity < 0.7:
-        gear_text += " (MICRO-PRECISION)"
-        gear_color = (255, 255, 0) # Cyan
-    elif prev_sensitivity > 1.3:
-        gear_text += " (HIGH-SPEED)"
-        gear_color = (0, 165, 255) # Orange
-    else:
-        gear_text += " (NORMAL)"
-        gear_color = (255, 255, 255) # White
+    if system_mode != "AUTONOMOUS":
+        gear_text = f"SENSITIVITY: {prev_sensitivity:.2f}x"
+        cv2.putText(img, gear_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-    cv2.putText(img, gear_text, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gear_color, 2)
+        # --- NEW: Predictive Status Display ---
+        pred_text = "PREDICTION: ACTIVE (AHEAD OF HAND)" if is_predicting else "PREDICTION: OFF (LAGGING)"
+        pred_color = (0, 255, 0) if is_predicting else (0, 0, 255)
+        cv2.putText(img, pred_text, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pred_color, 2)
+    else:
+        cv2.putText(img, "SENSITIVITY & PREDICTION: OVERRIDDEN", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
     cv2.imshow("Digital Twin - Spatial Tracking", img)
     
     key = cv2.waitKey(1) & 0xFF
     if key == ord('l'): 
         with open("waypoints_log.txt", "a") as file:
-            # We use a try block in case the system is paused and servo variables aren't initialized
             try:
                 file.write(f"Waypoint Logged (Manual) -> Pan: {servo_pan}, Tilt: {servo_tilt}\n")
-                print(f"[DATA] Manual Waypoint Logged: P:{servo_pan}, T:{servo_tilt}")
-                display_text_override = "MANUAL WAYPOINT SAVED"
                 last_log_time = time.time()
             except NameError:
-                print("[ERROR] Cannot log waypoint while system is paused.")
+                pass
     elif key == ord('q'): break
     elif key == ord('r'): 
         if system_mode == "NORMAL":
@@ -237,6 +294,12 @@ while True:
             playback_index = 0
         elif system_mode == "PLAYBACK":
             system_mode = "NORMAL" 
+    elif key == ord('a'): 
+        if system_mode in ["NORMAL", "AUTONOMOUS"]:
+            system_mode = "AUTONOMOUS" if system_mode == "NORMAL" else "NORMAL"
+    elif key == ord('k'): # --- NEW: Toggle Prediction ---
+        is_predicting = not is_predicting
+        print(f"[SYSTEM] Predictive Kinematics: {'ON' if is_predicting else 'OFF'}")
 
 cap.release()
 cv2.destroyAllWindows()
