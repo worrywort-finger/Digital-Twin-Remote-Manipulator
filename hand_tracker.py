@@ -3,6 +3,7 @@ import mediapipe as mp
 import socket
 import math 
 import time
+from collections import deque # --- NEW: High-speed sliding window for the graph ---
 
 # ==========================================
 # 1. NETWORK CONFIGURATION
@@ -41,11 +42,17 @@ prev_pan_angle = 0.0
 prev_tilt_angle = 0.0
 prev_sensitivity = 1.0 
 
-# --- NEW: Predictive Kinematics Variables ---
-is_predicting = False      # Toggle for presentation demonstration
-PREDICTION_FACTOR = 1.5    # How many frames into the future to predict (Tune between 1.0 and 3.0)
+# Predictive Kinematics Variables
+is_predicting = False      
+PREDICTION_FACTOR = 1.5    
 prev_tracker_x = 0.5
 prev_tracker_y = 0.5
+
+# --- NEW: Telemetry Oscilloscope Variables ---
+GRAPH_WIDTH = 150 # Number of frames to display on the graph
+raw_history = deque(maxlen=GRAPH_WIDTH)
+smooth_history = deque(maxlen=GRAPH_WIDTH)
+pred_history = deque(maxlen=GRAPH_WIDTH)
 
 # Expanded State Machine Variables
 was_pinched = False
@@ -64,7 +71,7 @@ print(" [OK Sign]    : Log Waypoint to File")
 print(" [ r ] Key    : Toggle Recording")
 print(" [ p ] Key    : Trigger Playback")
 print(" [ a ] Key    : Toggle Autonomous Sentry Mode") 
-print(" [ k ] Key    : Toggle Predictive Kinematics") # --- NEW ---
+print(" [ k ] Key    : Toggle Predictive Kinematics") 
 print(" [ l ] Key    : Manual Hardware Log")
 print(" [ q ] Key    : Quit")
 
@@ -113,53 +120,48 @@ while True:
                     
                     sock.sendto(f"{smoothed_pan},{smoothed_tilt}".encode(), (BLENDER_IP, BLENDER_PORT))
                     sock.sendto(f"P:{servo_pan},T:{servo_tilt}".encode(), (ESP32_IP, ESP32_PORT))
+                    
+                    # Flatten graph during homing
+                    raw_history.append(0.0)
+                    smooth_history.append(0.0)
+                    pred_history.append(0.0)
 
                 elif fingers_curled: 
                     is_tracking = False
                 elif fingers_extended: 
                     is_tracking = True
                 
-                # ==========================================
-                # THE KINEMATIC ENGINE (Tracking & Z-Axis & Prediction)
-                # ==========================================
+                # THE KINEMATIC ENGINE
                 if is_tracking and not peace_sign:
                     tracker_node = lm[9]
                     
                     curr_x = tracker_node.x
                     curr_y = tracker_node.y
                     
-                    # --- NEW: Predictive Math ---
                     if is_predicting:
-                        # Calculate velocity (Change in position since last frame)
                         vel_x = curr_x - prev_tracker_x
                         vel_y = curr_y - prev_tracker_y
                         
-                        # Project position into the future
                         target_x = curr_x + (vel_x * PREDICTION_FACTOR)
                         target_y = curr_y + (vel_y * PREDICTION_FACTOR)
                         
-                        # Clamp values between 0.0 and 1.0 to prevent servos from crashing
                         target_x = max(0.0, min(target_x, 1.0))
                         target_y = max(0.0, min(target_y, 1.0))
                         
-                        # Draw a green dot showing WHERE the robot thinks you are going
                         cv2.circle(img, (int(target_x * img.shape[1]), int(target_y * img.shape[0])), 8, (0, 255, 0), cv2.FILLED)
                     else:
                         target_x = curr_x
                         target_y = curr_y
                     
-                    # Update history for the NEXT frame's velocity calculation
                     prev_tracker_x = curr_x
                     prev_tracker_y = curr_y
 
-                    # Calculate Z-Axis Depth (Same as before)
                     hand_size = math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y)
                     hand_size = max(0.15, min(hand_size, 0.45))
                     target_sensitivity = map_range(hand_size, 0.15, 0.45, 0.3, 1.8)
                     current_sensitivity = (0.1 * target_sensitivity) + (0.9 * prev_sensitivity)
                     prev_sensitivity = current_sensitivity
                     
-                    # Apply Target X/Y (Predicted or Normal) to the Center-Relative Scaling
                     dx = target_x - 0.5
                     dy = target_y - 0.5
                     
@@ -184,11 +186,19 @@ while True:
                     if system_mode == "RECORDING":
                         memory_buffer.append((smoothed_pan, smoothed_tilt, servo_pan, servo_tilt))
 
-                # Waypoint Logging
+                    # --- NEW: Append Data to Graph History ---
+                    # Calculate true raw angle (without prediction) for the red line
+                    true_raw_dx = curr_x - 0.5
+                    true_raw_x = 0.5 + (true_raw_dx * current_sensitivity)
+                    true_raw_pan = map_range(true_raw_x, 0.0, 1.0, -60.0, 60.0)
+
+                    raw_history.append(true_raw_pan)
+                    smooth_history.append(smoothed_pan)
+                    pred_history.append(raw_pan) # If predicting, raw_pan holds the projected vector
+
                 if is_pinching and not was_pinched and is_tracking:
                     with open("waypoints_log.txt", "a") as file:
                         file.write(f"Waypoint Logged -> Pan: {servo_pan}, Tilt: {servo_tilt}\n")
-                    print(f"[DATA] Waypoint Logged: P:{servo_pan}, T:{servo_tilt}")
                     last_log_time = time.time()
                     was_pinched = True
                 elif not is_pinching:
@@ -200,14 +210,17 @@ while True:
 
                 mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-    # ---------------------------------------------------------
-    # BRANCH B & C remain identical...
-    # ---------------------------------------------------------
     elif system_mode == "PLAYBACK":
         if playback_index < len(memory_buffer):
             saved_pan, saved_tilt, saved_span, saved_stilt = memory_buffer[playback_index]
             sock.sendto(f"{saved_pan},{saved_tilt}".encode(), (BLENDER_IP, BLENDER_PORT))
             sock.sendto(f"P:{saved_span},T:{saved_stilt}".encode(), (ESP32_IP, ESP32_PORT))
+            
+            # Feed playback values to the graph
+            raw_history.append(saved_pan)
+            smooth_history.append(saved_pan)
+            pred_history.append(saved_pan)
+            
             playback_index += 1
         else:
             system_mode = "NORMAL"
@@ -235,6 +248,11 @@ while True:
             sock.sendto(f"{smoothed_pan},{smoothed_tilt}".encode(), (BLENDER_IP, BLENDER_PORT))
             sock.sendto(f"P:{servo_pan},T:{servo_tilt}".encode(), (ESP32_IP, ESP32_PORT))
             
+            # Feed face values to graph
+            raw_history.append(raw_pan)
+            smooth_history.append(smoothed_pan)
+            pred_history.append(raw_pan)
+
             ih, iw, _ = img.shape
             x, y, w, h = int(bboxC.xmin * iw), int(bboxC.ymin * ih), int(bboxC.width * iw), int(bboxC.height * ih)
             cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2) 
@@ -244,7 +262,7 @@ while True:
     # ==========================================
     # 5. VISUAL HUD & KEYBOARD HOOKS
     # ==========================================
-    cv2.rectangle(img, (0, 0), (640, 100), (0, 0, 0), cv2.FILLED) # Taller HUD for new text
+    cv2.rectangle(img, (0, 0), (640, 100), (0, 0, 0), cv2.FILLED) 
 
     if display_text_override != "":
         cv2.putText(img, f"STATE: {display_text_override}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
@@ -264,12 +282,44 @@ while True:
         gear_text = f"SENSITIVITY: {prev_sensitivity:.2f}x"
         cv2.putText(img, gear_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # --- NEW: Predictive Status Display ---
         pred_text = "PREDICTION: ACTIVE (AHEAD OF HAND)" if is_predicting else "PREDICTION: OFF (LAGGING)"
         pred_color = (0, 255, 0) if is_predicting else (0, 0, 255)
         cv2.putText(img, pred_text, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, pred_color, 2)
     else:
         cv2.putText(img, "SENSITIVITY & PREDICTION: OVERRIDDEN", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    # --- NEW: Draw Live Telemetry Oscilloscope ---
+    ih, iw, _ = img.shape
+    gh = 100 # Graph height
+    gw = GRAPH_WIDTH
+    gx = iw - gw - 10 # Bottom right X
+    gy = ih - gh - 10 # Bottom right Y
+
+    # Draw Box and Centerline
+    cv2.rectangle(img, (gx, gy), (gx + gw, gy + gh), (0, 0, 0), cv2.FILLED)
+    cv2.line(img, (gx, gy + int(gh/2)), (gx + gw, gy + int(gh/2)), (50, 50, 50), 1)
+
+    # Draw Legend
+    cv2.putText(img, "RAW", (gx + 5, gy + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+    cv2.putText(img, "SMOOTH", (gx + 40, gy + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 0), 1)
+    cv2.putText(img, "PREDICT", (gx + 95, gy + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+
+    # Helper function to plot lines
+    def plot_data(history, color):
+        if len(history) > 1:
+            for i in range(1, len(history)):
+                # Map -60/60 degrees to pixel height
+                y1 = int(map_range(history[i-1], -60.0, 60.0, gy + gh, gy))
+                x1 = gx + i - 1
+                y2 = int(map_range(history[i], -60.0, 60.0, gy + gh, gy))
+                x2 = gx + i
+                cv2.line(img, (x1, y1), (x2, y2), color, 1)
+
+    # Render lines (OpenCV uses BGR colors)
+    plot_data(raw_history, (0, 0, 255))   # Red
+    plot_data(smooth_history, (255, 0, 0)) # Blue
+    if is_predicting:
+        plot_data(pred_history, (0, 255, 0))  # Green
 
     cv2.imshow("Digital Twin - Spatial Tracking", img)
     
@@ -297,9 +347,8 @@ while True:
     elif key == ord('a'): 
         if system_mode in ["NORMAL", "AUTONOMOUS"]:
             system_mode = "AUTONOMOUS" if system_mode == "NORMAL" else "NORMAL"
-    elif key == ord('k'): # --- NEW: Toggle Prediction ---
+    elif key == ord('k'): 
         is_predicting = not is_predicting
-        print(f"[SYSTEM] Predictive Kinematics: {'ON' if is_predicting else 'OFF'}")
 
 cap.release()
 cv2.destroyAllWindows()
